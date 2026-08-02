@@ -1,0 +1,124 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: Build job ID
+        required: true
+        type: string
+      userId:
+        description: Telegram user ID
+        required: true
+        type: string
+      payload:
+        description: JSON build payload
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web2apk-flutter-${{ inputs.jobId }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      BUILD_PAYLOAD: ${{ inputs.payload }}
+
+    steps:
+      - name: Checkout worker repository
+        uses: actions/checkout@v7
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Parse payload
+        id: payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('fs');
+          const payload = JSON.parse(process.env.BUILD_PAYLOAD || '{}');
+          if (!payload.zipAssetUrl) throw new Error('zipAssetUrl tidak ada pada payload');
+          const output = process.env.GITHUB_OUTPUT;
+          fs.appendFileSync(output, `asset_url=${payload.zipAssetUrl}\n`);
+          fs.appendFileSync(output, `build_type=${payload.buildType === 'debug' ? 'debug' : 'release'}\n`);
+          NODE
+
+      - name: Download source ZIP
+        shell: bash
+        env:
+          ASSET_URL: ${{ steps.payload.outputs.asset_url }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p .github-build/source
+          curl --fail --location \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/octet-stream" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$ASSET_URL" -o .github-build/source.zip
+          unzip -q .github-build/source.zip -d .github-build/source
+
+      - name: Find Flutter project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          PUBSPEC="$(find .github-build/source -maxdepth 6 -type f -name pubspec.yaml | head -n 1)"
+          test -n "$PUBSPEC"
+          PROJECT_DIR="$(dirname "$PUBSPEC")"
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Install Flutter stable
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch stable https://github.com/flutter/flutter.git "$HOME/flutter"
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+          "$HOME/flutter/bin/flutter" config --no-analytics
+          "$HOME/flutter/bin/flutter" doctor -v
+
+      - name: Build Flutter APK
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        env:
+          BUILD_TYPE: ${{ steps.payload.outputs.build_type }}
+        run: |
+          set -euo pipefail
+          flutter clean
+          flutter pub get
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            flutter build apk --debug
+          else
+            flutter build apk --release
+          fi
+
+      - name: Collect APK
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p .github-build/output
+          APK_PATH="$(find "$PROJECT_DIR/build/app/outputs/flutter-apk" -type f -name '*.apk' | head -n 1)"
+          test -n "$APK_PATH"
+          cp "$APK_PATH" ".github-build/output/${{ inputs.jobId }}.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: .github-build/output/${{ inputs.jobId }}.apk
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
